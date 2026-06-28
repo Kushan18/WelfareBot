@@ -2,7 +2,31 @@
 
 FastAPI backend for the WelfareBot application with MongoDB database, LangGraph orchestration, and automated scheme scraping.
 
-## Setup
+## Quick Start
+
+```bash
+# 1. Create and activate virtual environment
+python -m venv venv
+venv\Scripts\Activate  # Windows
+# or: source venv/bin/activate  # macOS/Linux
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Install Playwright browsers
+playwright install chromium
+
+# 4. Set up environment variables
+copy .env.example .env
+# Edit .env with your actual keys
+
+# 5. Start the server
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+The API will be available at http://localhost:8000
+
+## Setup Instructions
 
 1. Create virtual environment:
 ```bash
