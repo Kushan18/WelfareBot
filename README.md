@@ -139,7 +139,7 @@ python -m scraper.seed --force
 
 ## Deployment on Render
 
-### Backend Deployment
+### Backend + Frontend (Single Service)
 
 1. Create a new Web Service on Render
 2. Connect your GitHub repository (WelfareBot)
@@ -149,8 +149,7 @@ python -m scraper.seed --force
    - `ADMIN_API_KEY`: Your admin API key
 4. Build command:
    ```bash
-   pip install -r requirements.txt
-   playwright install chromium
+   cd frontend && npm install && npm run build && cd .. && pip install -r requirements.txt
    ```
 5. Start command:
    ```bash
@@ -158,19 +157,4 @@ python -m scraper.seed --force
    ```
 6. Click "Deploy Web Service"
 
-### Frontend Deployment
-
-1. Create a new Web Service on Render
-2. Connect your GitHub repository (WelfareBot - frontend branch or separate repo)
-3. Set environment variable:
-   - `REACT_APP_API_URL`: Your backend Render URL (e.g., https://your-backend.onrender.com)
-4. Build command:
-   ```bash
-   npm install
-   npm run build
-   ```
-5. Start command:
-   ```bash
-   npm start
-   ```
-6. Click "Deploy Web Service"
+This will build the React frontend and serve it from the same URL as the backend API.

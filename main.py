@@ -17,6 +17,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 
@@ -392,6 +394,35 @@ async def health():
 async def get_schemes():
     schemes = list(sync_schemes_collection.find({}, {"_id": 0}))
     return {"schemes": schemes}
+
+
+# Serve React frontend (SPA)
+# Mount static files
+try:
+    app.mount("/static", StaticFiles(directory="frontend/build/static"), name="static")
+    app.mount("/favicon.ico", StaticFiles(directory="frontend/build"), name="favicon")
+except Exception as e:
+    logger.warning(f"Could not mount static files (frontend may not be built yet): {e}")
+
+@app.get("/")
+async def serve_react():
+    try:
+        return FileResponse("frontend/build/index.html")
+    except Exception as e:
+        logger.warning(f"Could not serve index.html (frontend may not be built yet): {e}")
+        return {"status": "backend_running", "message": "Frontend not built yet"}
+
+@app.get("/{full_path:path}")
+async def catch_all(full_path: str):
+    """Catch all routes for React SPA routing"""
+    # Don't catch API routes
+    if full_path.startswith("api") or full_path.startswith("admin") or full_path.startswith("health"):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        return FileResponse("frontend/build/index.html")
+    except Exception as e:
+        logger.warning(f"Could not serve index.html (frontend may not be built yet): {e}")
+        raise HTTPException(status_code=404, detail="Frontend not built yet")
 
 
 @app.get("/session")

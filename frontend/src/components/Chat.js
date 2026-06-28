@@ -4,7 +4,7 @@ import MessageBubble from './MessageBubble';
 import ChipRow from './ChipRow';
 import './Chat.css';
 
-const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const API = process.env.REACT_APP_API_URL || '';
 
 const WELCOME = {
   id: 'w', role: 'bot',
