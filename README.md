@@ -1,6 +1,18 @@
-# WelfareBot Backend
+# WelfareBot
 
-FastAPI backend for the WelfareBot application with MongoDB database, LangGraph orchestration, and automated scheme scraping.
+Full-stack WelfareBot application with React frontend and FastAPI backend.
+
+## Project Structure
+
+```
+welfare_2-backend/
+├── frontend/          # React frontend
+├── agent/            # LangGraph agent logic
+├── scraper/          # Scheme scraping modules
+├── rag/              # RAG retrieval modules
+├── main.py           # FastAPI backend
+└── requirements.txt  # Python dependencies
+```
 
 ## Quick Start
 
@@ -124,3 +136,41 @@ python -m scraper.seed --force
 - `staging` - Staged schemes pending approval
 - `conversations` - Chat history
 - `reminders` - Scheduled reminders
+
+## Deployment on Render
+
+### Backend Deployment
+
+1. Create a new Web Service on Render
+2. Connect your GitHub repository (WelfareBot)
+3. Set environment variables:
+   - `GROQ_API_KEY`: Your Groq API key
+   - `MONGODB_URI`: Your MongoDB connection string
+   - `ADMIN_API_KEY`: Your admin API key
+4. Build command:
+   ```bash
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
+5. Start command:
+   ```bash
+   uvicorn main:app --host 0.0.0.0 --port $PORT
+   ```
+6. Click "Deploy Web Service"
+
+### Frontend Deployment
+
+1. Create a new Web Service on Render
+2. Connect your GitHub repository (WelfareBot - frontend branch or separate repo)
+3. Set environment variable:
+   - `REACT_APP_API_URL`: Your backend Render URL (e.g., https://your-backend.onrender.com)
+4. Build command:
+   ```bash
+   npm install
+   npm run build
+   ```
+5. Start command:
+   ```bash
+   npm start
+   ```
+6. Click "Deploy Web Service"
