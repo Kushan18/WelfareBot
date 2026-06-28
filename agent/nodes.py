@@ -5,9 +5,6 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from pymongo import MongoClient
 import motor.motor_asyncio
 from groq import Groq
@@ -22,28 +19,24 @@ MONGODB_URI = os.getenv("MONGODB_URI")
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI environment variable not set")
 
-# Initialize Groq client
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Initialize Groq client (will be set by main.py)
+groq_client = None
 
-# Initialize MongoDB clients
-sync_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-async_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+# Initialize MongoDB clients (will be set by main.py)
+sync_users_collection = None
+sync_schemes_collection = None
+conversations_collection = None
 
-# Collections (sync for fast look‑ups, async for chat history)
-sync_db = sync_client["welfarebot"]
-sync_users_collection = sync_db["users"]
-sync_schemes_collection = sync_db["schemes"]
-conversations_collection = async_client["welfarebot"]["conversations"]
-
-# FastAPI app
-app = FastAPI(title="WelfareBot Backend")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Set up MongoDB connection if running standalone
+if not groq_client:
+    from pymongo import MongoClient
+    import motor.motor_asyncio
+    sync_mongo_client = MongoClient(MONGODB_URI)
+    async_mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
+    sync_users_collection = sync_mongo_client["welfarebot"]["users"]
+    sync_schemes_collection = sync_mongo_client["welfarebot"]["schemes"]
+    conversations_collection = async_mongo_client["welfarebot"]["conversations"]
+    groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Logging
 logger = logging.getLogger(__name__)
@@ -73,24 +66,41 @@ SCHEME_KEYWORDS = [
     "assistance",
 ]
 
+# Keywords that indicate user wants to find schemes for themselves (needs profile)
+PROFILE_REQUIRED_KEYWORDS = [
+    "eligible for",
+    "am i eligible",
+    "my schemes",
+    "schemes for me",
+    "what schemes",
+    "find schemes",
+    "match me",
+]
+
 # ---------- Helper Functions ----------
 def extract_first_name(text: str) -> str:
     """Extract a first name using regex patterns.
     Returns capitalised name or a fallback.
     """
     patterns = [
-        r"my\s+name\s+is\s+(\\w+)",
-        r"i\s+am\s+(\\w+)",
-        r"i['’]?m\s+(\\w+)",
-        r"call\s+me\s+(\\w+)",
+        r"my\s+name\s+is\s+(\w+)",
+        r"i\s+am\s+(\w+)",
+        r"i['']?m\s+(\w+)",
+        r"call\s+me\s+(\w+)",
     ]
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             return m.group(1).capitalize()
-    # fallback – first word
+    # fallback – first word (but exclude common words and phrases)
     words = text.strip().split()
-    return words[0].capitalize() if words else "Friend"
+    if words:
+        first_word = words[0].capitalize()
+        # Skip if it's a common filler word or greeting
+        skip_words = ["i", "hi", "hello", "hey", "the", "a", "an", "my", "am", "is", "welcome", "to", "welfarebot", "we", "help"]
+        if first_word.lower() not in skip_words:
+            return first_word
+    return "Friend"
 
 def safe_groq_chat(messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
     """Call Groq chat completion with retries and timeout.
@@ -114,22 +124,60 @@ def safe_groq_chat(messages: List[Dict[str, str]], temperature: float = 0.7) -> 
 
 # ---------- Intent Detection & Handlers ----------
 def detect_intent(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Determine user intent for routing.
-    Updates `state["intent"]`.
+    """Determine user intent for routing with smart detection.
+    Updates `state["intent"].
     """
     message = state.get("message", "").lower()
-    user_doc = state.get("user_profile", {})
+    session_id = state.get("session_id")
+    user_doc = sync_users_collection.find_one({"session_id": session_id}) or {}
+    
+    # Check if user is in middle of onboarding
+    onboarding_step = user_doc.get("onboarding_step", "name")
+    
+    # Active onboarding steps - if user is in any of these, always route to onboarding
+    active_onboarding_steps = [
+        "language_preference", "form_chat_choice", "state", "occupation", 
+        "caste_category", "gender", "age", "income_bracket", "confirmation"
+    ]
+    
+    is_in_active_onboarding = onboarding_step in active_onboarding_steps
+    
     # Scheme‑related keywords
     is_scheme_question = any(kw in message for kw in SCHEME_KEYWORDS)
+    # Check if user wants personal scheme matching (needs profile)
+    needs_profile = any(kw in message for kw in PROFILE_REQUIRED_KEYWORDS)
     profile_complete = all(user_doc.get(f) for f in REQUIRED_FIELDS)
-    if is_scheme_question and not profile_complete:
+    
+    # Check if message looks like a name (simple heuristic: single word, not a keyword)
+    words = message.strip().split()
+    looks_like_name = len(words) <= 2 and not any(kw in message for kw in SCHEME_KEYWORDS + ["what", "how", "why", "tell", "know", "want", "need"])
+    
+    # Smart routing logic:
+    # 1. If user is in active onboarding step, always continue onboarding
+    if is_in_active_onboarding:
         intent = "onboarding"
-    elif is_scheme_question and profile_complete:
+    # 2. If user has name but not complete, continue onboarding
+    elif onboarding_step != "complete" and user_doc.get("name"):
+        intent = "onboarding"
+    # 3. If user provides a name (looks like name and no name yet) -> onboarding
+    elif looks_like_name and not user_doc.get("name"):
+        intent = "onboarding"
+    # 4. If user wants personal scheme matching but doesn't have complete profile -> onboarding
+    elif needs_profile and not profile_complete:
+        intent = "onboarding"
+    # 5. If user wants personal scheme matching and has complete profile -> scheme_query
+    elif needs_profile and profile_complete:
         intent = "scheme_query"
+    # 6. If user asks general scheme questions (not personal) -> FAQ with general knowledge
+    elif is_scheme_question:
+        intent = "faq"
+    # 7. Otherwise (general questions, greetings, etc.) -> FAQ with general knowledge
     else:
         intent = "faq"
+    
     state["intent"] = intent
-    logger.info(f"detect_intent -> {intent}")
+    state["user_profile"] = user_doc
+    logger.info(f"detect_intent -> {intent} (onboarding_step: {onboarding_step})")
     return state
 
 def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -179,12 +227,12 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
             if key in lower_msg:
                 lang = code
                 break
-        # After language, ask if the user wants to continue with profile collection
-        update_profile({"language_preference": lang, "onboarding_step": "continue_confirm"})
+        # After language, ask if user wants to fill form or chat
+        update_profile({"language_preference": lang, "onboarding_step": "form_chat_choice"})
         state["reply"] = (
-            "Great! Do you want to continue providing your details so I can find the best schemes for you? (yes/no)"
+            "Would you like to fill a form or just chat?"
         )
-        state["onboarding_step"] = "continue_confirm"
+        state["onboarding_step"] = "form_chat_choice"
         return state
 
     # Subsequent fields order
@@ -204,6 +252,23 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
         "age": "How old are you?",
         "income_bracket": "Annual family income in rupees?",
     }
+    
+    # Handle form/chat choice
+    if current_step == "form_chat_choice":
+        if message.strip().lower() in ["fill form", "form", "yes"]:
+            # Start collecting profile fields
+            update_profile({"onboarding_step": "state"})
+            state["reply"] = "Great! Which state are you from?"
+            state["onboarding_step"] = "state"
+        elif message.strip().lower() in ["chat", "chat instead", "no", "just chat"]:
+            # Switch to chat mode - mark onboarding as complete
+            update_profile({"onboarding_step": "complete"})
+            state["reply"] = "Sure! Feel free to ask me any questions about welfare schemes or general topics. I'm here to help!"
+            state["onboarding_step"] = "complete"
+        else:
+            state["reply"] = "Please choose: 'Fill Form' or 'Chat Instead'"
+        return state
+    
     if current_step == "continue_confirm":
         # User answered yes/no to continue profile collection
         if message.strip().lower() in ["yes", "y", "yeah", "sure"]:
@@ -217,18 +282,95 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
             state["reply"] = "No problem! Feel free to ask me any question about welfare schemes."
         return state
     if current_step in fields_order:
-        update_profile({current_step: message, "onboarding_step": fields_order[fields_order.index(current_step) + 1] if current_step != fields_order[-1] else "completed"})
+        update_profile({current_step: message, "onboarding_step": fields_order[fields_order.index(current_step) + 1] if current_step != fields_order[-1] else "confirmation"})
         # Determine next missing field
         user_doc = sync_users_collection.find_one({"session_id": session_id}) or {}
         missing = [f for f in REQUIRED_FIELDS if not user_doc.get(f)]
         if not missing:
-            # Profile complete – forward to scheme query
-            state["intent"] = "scheme_query"
-            return handle_scheme_query(state)
+            # Profile complete – show confirmation summary
+            summary = (
+                f"Please confirm your details:\n\n"
+                f"Name: {user_doc.get('name')}\n"
+                f"Language: {user_doc.get('language_preference')}\n"
+                f"State: {user_doc.get('state')}\n"
+                f"Occupation: {user_doc.get('occupation')}\n"
+                f"Category: {user_doc.get('caste_category')}\n"
+                f"Gender: {user_doc.get('gender')}\n"
+                f"Age: {user_doc.get('age')}\n"
+                f"Income: {user_doc.get('income_bracket')}\n\n"
+                f"Is this correct?"
+            )
+            state["reply"] = summary
+            state["onboarding_step"] = "confirmation"
+            update_profile({"confirmation_step": "awaiting_confirmation"})
+            state["confirmation_step"] = "awaiting_confirmation"
+            return state
         next_field = missing[0]
         state["reply"] = questions.get(next_field, f"Please provide your {next_field}.")
         state["onboarding_step"] = next_field
         return state
+
+    # Handle confirmation step
+    if current_step == "confirmation":
+        # Get confirmation_step from user profile (stored in MongoDB)
+        confirmation_step = user_doc.get("confirmation_step", "awaiting_confirmation")
+        
+        if confirmation_step == "awaiting_confirmation":
+            if message.strip().lower() in ["yes", "y", "yeah", "correct", "right"]:
+                # User confirmed – mark profile as complete and proceed to scheme matching
+                update_profile({"onboarding_step": "complete", "confirmation_step": "completed"})
+                state["intent"] = "scheme_query"
+                return handle_scheme_query(state)
+            elif message.strip().lower() in ["no", "n", "edit", "change"]:
+                update_profile({"confirmation_step": "selecting_field"})
+                state["reply"] = "Which field would you like to edit? (name, state, occupation, category, gender, age, income)"
+                state["confirmation_step"] = "selecting_field"
+                state["editing_field"] = None
+                return state
+            else:
+                state["reply"] = "Please respond with 'Yes' to continue or 'No' to edit your details."
+                return state
+        elif state.get("confirmation_step") == "selecting_field":
+            # Map user input to field names
+            field_map = {
+                "name": "name",
+                "state": "state",
+                "occupation": "occupation",
+                "category": "caste_category",
+                "gender": "gender",
+                "age": "age",
+                "income": "income_bracket"
+            }
+            field_to_edit = field_map.get(message.lower().strip())
+            if not field_to_edit:
+                state["reply"] = "Please choose: name, state, occupation, category, gender, age, or income"
+                return state
+            state["editing_field"] = field_to_edit
+            state["reply"] = f"What is your new {field_to_edit}?"
+            state["confirmation_step"] = "editing_value"
+            return state
+        elif state.get("confirmation_step") == "editing_value":
+            field_to_edit = state.get("editing_field")
+            if field_to_edit:
+                update_profile({field_to_edit: message})
+                # Show summary again
+                user_doc = sync_users_collection.find_one({"session_id": session_id}) or {}
+                summary = (
+                    f"Please confirm your updated details:\n"
+                    f"Name: {user_doc.get('name')}\n"
+                    f"Language: {user_doc.get('language_preference')}\n"
+                    f"State: {user_doc.get('state')}\n"
+                    f"Occupation: {user_doc.get('occupation')}\n"
+                    f"Category: {user_doc.get('caste_category')}\n"
+                    f"Gender: {user_doc.get('gender')}\n"
+                    f"Age: {user_doc.get('age')}\n"
+                    f"Income: {user_doc.get('income_bracket')}\n\n"
+                    f"Is this correct?"
+                )
+                state["reply"] = summary
+                state["confirmation_step"] = "awaiting_confirmation"
+                state["editing_field"] = None
+                return state
 
     # Fallback – should not reach here
     state["reply"] = "Could you provide more details?"
@@ -237,12 +379,11 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
 def handle_faq(state: Dict[str, Any]) -> Dict[str, Any]:
     """Answer generic questions via Groq without needing a profile."""
     user_doc = state.get("user_profile", {})
-    name_part = f"The user's name is {user_doc.get('name')}. " if user_doc.get("name") else ""
-    system_prompt = (
-        "You are a helpful welfare officer assistant. "
-        + name_part +
-        "Answer questions about government schemes, eligibility, and how to apply. Be friendly and concise."
-    )
+    language = user_doc.get("language_preference", "en")
+    
+    # Import language prompts
+    from agent.languages import SYSTEM_PROMPTS
+    system_prompt = SYSTEM_PROMPTS.get(language, SYSTEM_PROMPTS["en"])
     reply = safe_groq_chat(
         [
             {"role": "system", "content": system_prompt},
@@ -254,103 +395,118 @@ def handle_faq(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 def handle_scheme_query(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Return matching schemes based on the stored user profile."""
+    """Return matching schemes based on the stored user profile with Phase 8 3-tier retrieval."""
     session_id = state["session_id"]
+    user_message = state["message"].lower()
     user_doc = sync_users_collection.find_one({"session_id": session_id}) or {}
+    
+    # Check if user is asking detailed question about a specific scheme
+    scheme_keywords = ["what", "how", "documents", "need", "require", "details", "benefits", "eligible"]
+    asking_details = any(kw in user_message for kw in scheme_keywords)
+    
     try:
         from agent.eligibility import match_schemes
         schemes = match_schemes(user_doc, sync_schemes_collection)
-        if schemes:
-            scheme_text = "\n".join(
-                [f"• **{s['name']}**: {s['description']}\n  Apply: {s['apply_link']}" for s in schemes[:5]]
-            )
-            state["reply"] = f"Here are the schemes that match your profile:\n{scheme_text}"
+        
+        if not schemes:
+            state["reply"] = "No matching schemes found."
+            return state
+        
+        # If asking for details, use Phase 8 3-tier retrieval
+        if asking_details and schemes:
+            top_scheme = schemes[0]
+            scheme_name = top_scheme.get('name', '')
+            
+            logger.info(f"User asking details about: {scheme_name}")
+            
+            # TIER 1: Try ChromaDB first
+            try:
+                from agent.chroma_retrieval import get_scheme_details_from_chroma
+                chroma_result = get_scheme_details_from_chroma(scheme_name)
+                
+                if chroma_result and chroma_result.get("found"):
+                    logger.info(f"Found scheme in ChromaDB: {scheme_name}")
+                    # Use Groq to answer based on ChromaDB data
+                    answer = safe_groq_chat([
+                        {"role": "system", "content": f"You are a helpful assistant for Indian welfare schemes. Answer the user's question based ONLY on the following scheme data. If the answer is not in the data, say so.\n\nScheme Data:\n{chroma_result['text']}"},
+                        {"role": "user", "content": state["message"]}
+                    ])
+                    state["reply"] = f"For **{scheme_name}**:\n\n{answer}"
+                    return state
+            except Exception as e:
+                logger.warning(f"ChromaDB retrieval failed: {e}")
+            
+            # TIER 2: Try live fetch
+            try:
+                import asyncio
+                from live_fetcher.live_scheme_fetcher import fetch_scheme_details_live
+                from live_fetcher.groq_live_parser import answer_scheme_question_with_live_data
+                
+                logger.info(f"ChromaDB miss, trying live fetch for: {scheme_name}")
+                live_data = asyncio.run(fetch_scheme_details_live(scheme_name))
+                
+                if live_data:
+                    # Get Groq answer based on live data
+                    answer = answer_scheme_question_with_live_data(
+                        groq_client, 
+                        scheme_name, 
+                        state["message"], 
+                        live_data
+                    )
+                    
+                    state["reply"] = f"For **{scheme_name}**:\n\n{answer}"
+                    
+                    # Store in ChromaDB for future use
+                    try:
+                        from agent.chroma_retrieval import populate_chroma_from_mongodb
+                        populate_chroma_from_mongodb(sync_schemes_collection)
+                    except Exception as chroma_error:
+                        logger.warning(f"Failed to update ChromaDB: {chroma_error}")
+                    
+                    return state
+            except Exception as e:
+                logger.warning(f"Live fetch failed: {e}")
+            
+            # TIER 3: Fallback to Groq knowledge with disclaimer
+            logger.info(f"Live fetch failed, using Groq knowledge for: {scheme_name}")
+            answer = safe_groq_chat([
+                {"role": "system", "content": f"You are a helpful assistant for Indian welfare schemes. The user is asking about '{scheme_name}'. Provide helpful information based on your knowledge, but clearly state that this information may be outdated and they should verify from the official government website. Do not hallucinate specific details like income limits or deadlines."},
+                {"role": "user", "content": state["message"]}
+            ])
+            state["reply"] = f"For **{scheme_name}**:\n\n{answer}\n\n*Note: This information is based on general knowledge and may be outdated. Please verify from the official government website.*"
+        
         else:
-            state["reply"] = "No exact matches found right now. Check back later for new schemes!"
+            # Just show matching schemes list
+            scheme_list = "\n".join([
+                f"• **{s['name']}** - {s['description']}\n  Apply: {s['apply_link']}"
+                for s in schemes[:3]
+            ])
+            
+            state["reply"] = f"Found {len(schemes)} matching schemes:\n\n{scheme_list}\n\nAsk me details about any scheme!"
+    
     except Exception as e:
         logger.error(f"Scheme query error: {e}")
-        state["reply"] = "I’m having trouble fetching schemes right now. Please try again later."
+        state["reply"] = "I had trouble retrieving schemes. Please try again."
+    
     return state
 
-# ---------- Request Models ----------
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-
-class SubmitProfileRequest(BaseModel):
-    session_id: str
-    name: str
-    language_preference: str
-    state: str
-    occupation: str
-    caste_category: str
-    gender: str
-    age: str
-    income_bracket: str
-    aadhaar: Optional[str] = ""
-
-class ChatResponse(BaseModel):
-    reply: str
-
-# ---------- API Endpoints ----------
-@app.get("/health")
-async def health():
-    return {"status": "running", "db": "connected"}
-
-@app.get("/schemes")
-async def get_schemes():
-    schemes = list(sync_schemes_collection.find({}, {"_id": 0}))
-    return {"schemes": schemes}
-
-@app.get("/session")
-async def get_session(session_id: str):
-    user = sync_users_collection.find_one({"session_id": session_id})
-    return {"session_id": session_id, "profile": user or {}}
-
-@app.post("/submit-profile")
-async def submit_profile(request: SubmitProfileRequest):
-    try:
-        prof = request.dict()
-        sync_users_collection.update_one(
-            {"session_id": request.session_id},
-            {"$set": prof},
-            upsert=True,
-        )
-        from agent.eligibility import match_schemes
-        schemes = match_schemes(prof, sync_schemes_collection)
-        return {"status": "success", "schemes": schemes[:5]}
-    except Exception as e:
-        logger.error(f"submit_profile error: {e}")
-        return {"error": str(e)}
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    session_id = request.session_id
-    message = request.message.strip()
-    if not message:
-        return ChatResponse(reply="Please say something.")
-    # Load user profile for context
-    user_doc = sync_users_collection.find_one({"session_id": session_id}) or {}
-    state = {
-        "session_id": session_id,
-        "message": message,
-        "user_profile": user_doc,
-        "intent": None,
-        "reply": None,
-    }
-    # Route via graph (will call appropriate handler)
-    try:
-        from agent.graph import welfare_graph
-        result = welfare_graph.invoke(state)
-        reply = result.get("reply", "Sorry, I couldn’t process that.")
-    except Exception as e:
-        logger.error(f"/chat error: {e}")
-        reply = f"Error: {str(e)[:100]}"
-    # Store conversation asynchronously
-    await conversations_collection.insert_one({
-        "session_id": session_id,
-        "user_message": message,
-        "bot_reply": reply,
-        "timestamp": datetime.utcnow(),
-    })
-    return ChatResponse(reply=reply)
+def calculate_confidence(message: str, user_doc: dict) -> float:
+    """Calculate confidence score for the response (0-100)."""
+    confidence = 85.0  # Base confidence
+    
+    # Higher confidence for scheme-related questions
+    scheme_keywords = ["scheme", "yojana", "benefit", "eligible", "pension", "scholarship", "kisan", "farmer", "student"]
+    if any(kw in message.lower() for kw in scheme_keywords):
+        confidence += 10
+    
+    # Lower confidence for very general or vague questions
+    vague_keywords = ["something", "anything", "help", "what", "how"]
+    if len(message.split()) < 3 or any(kw in message.lower() for kw in vague_keywords):
+        confidence -= 15
+    
+    # Higher confidence if user has profile
+    if user_doc and user_doc.get("name"):
+        confidence += 5
+    
+    # Clamp between 0 and 100
+    return max(0, min(100, confidence))

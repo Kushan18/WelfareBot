@@ -83,6 +83,7 @@ class ChatResponse(BaseModel):
     reply: str
     show_form_choice: Optional[bool] = None
     clear_session: Optional[bool] = None
+    chips: Optional[List[str]] = None
 
 
 class SubmitProfileRequest(BaseModel):
@@ -97,6 +98,63 @@ class SubmitProfileRequest(BaseModel):
     income_bracket: str
     aadhaar: Optional[str] = ""
 
+
+# Helper function to generate chips dynamically
+def generate_chips(onboarding_step: str, user_doc: dict, intent: str = None, schemes: list = None) -> List[str]:
+    """Generate suggestion chips based on conversation state."""
+    chips = []
+    
+    # Always add Start Over
+    chips.append("Start Over")
+    
+    if onboarding_step == "name":
+        chips.extend(["English", "हिंदी", "తెలుగు", "தமிழ்", "ಕನ್ನಡ"])
+    elif onboarding_step == "language_preference":
+        chips.extend(["Fill Form", "Chat Instead"])
+    elif onboarding_step == "form_chat_choice":
+        chips.extend(["Fill Form", "Chat Instead"])
+    elif onboarding_step == "state":
+        chips.extend(["Andhra Pradesh", "Telangana", "Delhi", "Maharashtra", "Tamil Nadu", "Karnataka"])
+    elif onboarding_step == "occupation":
+        chips.extend(["Student", "Farmer", "Daily Wage", "Business", "Government", "Other"])
+    elif onboarding_step == "caste_category":
+        chips.extend(["General", "OBC", "SC", "ST"])
+    elif onboarding_step == "gender":
+        chips.extend(["Male", "Female", "Other"])
+    elif onboarding_step == "age":
+        chips.extend(["18-25", "26-35", "36-50", "50+"])
+    elif onboarding_step == "income_bracket":
+        chips.extend(["Below 1 Lakh", "1-2.5 Lakh", "2.5-5 Lakh", "5-10 Lakh", "Above 10 Lakh"])
+    elif onboarding_step == "confirmation":
+        chips.extend(["Yes Continue", "Edit Details"])
+    elif intent == "scheme_query" and schemes:
+        # Add scheme names as chips
+        for scheme in schemes[:5]:
+            chips.append(scheme.get("name", "Unknown Scheme"))
+        chips.append("Ask Something Else")
+    elif intent == "faq":
+        # Enhanced quick reply chips for FAQ/general queries
+        quick_replies = [
+            "Find My Schemes",
+            "Check Eligibility",
+            "Documents Needed",
+            "Application Deadlines",
+            "Contact Support"
+        ]
+        chips.extend(quick_replies)
+        chips.append("Ask Something Else")
+    elif onboarding_step is None and intent == "faq":
+        # General conversation quick replies
+        general_replies = [
+            "Tell me about PM Kisan",
+            "Farmer schemes in Telangana",
+            "Student scholarships",
+            "Pension schemes",
+            "Health insurance schemes"
+        ]
+        chips.extend(general_replies)
+    
+    return chips
 
 # Endpoints
 @app.get("/health")
@@ -129,7 +187,14 @@ async def submit_profile(request: SubmitProfileRequest):
         from agent.eligibility import match_schemes
 
         schemes = match_schemes(profile_dict, sync_schemes_collection)
-        return {"status": "success", "schemes": schemes[:5]}
+        # Convert ObjectId to string for JSON serialization
+        schemes_list = []
+        for scheme in schemes[:5]:
+            scheme_dict = dict(scheme)
+            if "_id" in scheme_dict:
+                scheme_dict["_id"] = str(scheme_dict["_id"])
+            schemes_list.append(scheme_dict)
+        return {"status": "success", "schemes": schemes_list}
     except Exception as e:
         return {"error": str(e)}
 
@@ -143,30 +208,10 @@ async def chat(request: ChatRequest):
         if not message:
             return ChatResponse(reply="Please say something.")
 
-        # Determine onboarding flow
+        # Use LangGraph for all routing (smart routing + onboarding + FAQ + schemes)
         user_doc = sync_users_collection.find_one({"session_id": session_id}) or {}
         onboarding_step = user_doc.get("onboarding_step", "name")
 
-        # ---- Onboarding flow ----
-        if onboarding_step == "name" and not user_doc.get("name"):
-            sync_users_collection.update_one(
-                {"session_id": session_id},
-                {"$set": {"name": message, "onboarding_step": "language"}},
-                upsert=True,
-            )
-            reply = f"Hello {message}, nice to meet you! Please select your preferred language.\nCHIPS:['English','हिंदी','తెలుగు','தமிழ்','ಕನ್ನಡ']"
-            return ChatResponse(reply=reply, show_form_choice=False, clear_session=False)
-
-        if onboarding_step == "language" and not user_doc.get("language_preference"):
-            sync_users_collection.update_one(
-                {"session_id": session_id},
-                {"$set": {"language_preference": message, "onboarding_step": "details"}},
-                upsert=True,
-            )
-            reply = "Great! Now we can continue. Would you like to fill a form or just chat?\nCHIPS:['📝 Fill Form','💬 Chat instead']"
-            return ChatResponse(reply=reply, show_form_choice=True, clear_session=False)
-
-        # Existing handling for other messages
         state = {
             "session_id": session_id,
             "message": message,
@@ -183,6 +228,11 @@ async def chat(request: ChatRequest):
         reply = result.get("reply", "Sorry, couldn't process that.")
         show_form_choice = result.get("show_form_choice", False)
         clear_session = result.get("clear_session", False)
+        
+        # Generate chips based on result state
+        result_onboarding_step = result.get("onboarding_step", onboarding_step)
+        result_intent = result.get("intent")
+        chips = generate_chips(result_onboarding_step, user_doc, result_intent)
 
         await conversations_collection.insert_one({
             "session_id": session_id,
@@ -191,11 +241,24 @@ async def chat(request: ChatRequest):
             "intent": result.get("intent"),
             "timestamp": datetime.utcnow(),
         })
+        
+        # Save to conversation history
+        from agent.conversation_history import save_conversation
+        try:
+            # Get current messages from frontend or build from DB
+            existing_history = sync_users_collection.find_one({"session_id": session_id}) or {}
+            messages = existing_history.get("messages", [])
+            messages.append({"role": "user", "text": message, "timestamp": datetime.utcnow().isoformat()})
+            messages.append({"role": "bot", "text": reply, "timestamp": datetime.utcnow().isoformat()})
+            save_conversation(session_id, messages, user_doc)
+        except Exception as e:
+            logger.error(f"Failed to save conversation history: {e}")
 
         return ChatResponse(
             reply=reply,
             show_form_choice=show_form_choice,
             clear_session=clear_session,
+            chips=chips,
         )
     except Exception as e:
         logging.error(f"Chat endpoint error: {e}")
@@ -216,6 +279,14 @@ print(f"[OK] LangGraph: {welfare_graph}")
 collection = chroma_client.get_or_create_collection(name="welfare_schemes")
 print("=" * 50 + "\n")
 
+# Start Phase 7 scraper scheduler (runs every 2 days)
+try:
+    from scraper.main_scheduler import start_scheduler
+    start_scheduler()
+    print("[SCRAPER] 2-day scheduler started successfully")
+except Exception as e:
+    print(f"[SCRAPER] Scheduler startup failed: {e}")
+
 # -------------------- API ENDPOINTS --------------------
 
 # Existing staging endpoint
@@ -225,6 +296,163 @@ async def get_staging():
     db = client.get_default_database()
     cursor = db.staging.find({"status": "pending"}).sort("scraped_at", -1).limit(100)
     return await cursor.to_list(length=100)
+
+
+# Approval workflow endpoints
+@app.get("/admin/staging")
+async def get_staging_schemes():
+    """Get all schemes in staging awaiting review."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    schemes = workflow.get_staging_schemes()
+    # Convert ObjectId to string for JSON serialization
+    for scheme in schemes:
+        if "_id" in scheme:
+            scheme["_id"] = str(scheme["_id"])
+    return {"schemes": schemes}
+
+@app.get("/admin/pending")
+async def get_pending_schemes():
+    """Get all schemes in pending_approval."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    schemes = workflow.get_pending_schemes()
+    # Convert ObjectId to string for JSON serialization
+    for scheme in schemes:
+        if "_id" in scheme:
+            scheme["_id"] = str(scheme["_id"])
+    return {"schemes": schemes}
+
+@app.post("/admin/approve/{scheme_id}")
+async def approve_scheme(scheme_id: str):
+    """Approve a scheme from staging to pending_approval."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    success = workflow.approve_scheme(scheme_id)
+    if success:
+        return {"status": "success", "message": "Scheme moved to pending approval"}
+    return {"status": "error", "message": "Failed to approve scheme"}
+
+@app.post("/admin/reject-staging/{scheme_id}")
+async def reject_staging_scheme(scheme_id: str, reason: str = ""):
+    """Reject a scheme from staging."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    success = workflow.reject_scheme(scheme_id, reason)
+    if success:
+        return {"status": "success", "message": "Scheme rejected"}
+    return {"status": "error", "message": "Failed to reject scheme"}
+
+@app.post("/admin/publish/{scheme_id}")
+async def publish_scheme(scheme_id: str):
+    """Publish a scheme from pending_approval to live."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    success = workflow.publish_scheme(scheme_id)
+    if success:
+        return {"status": "success", "message": "Scheme published to live"}
+    return {"status": "error", "message": "Failed to publish scheme"}
+
+@app.post("/admin/reject-pending/{scheme_id}")
+async def reject_pending_scheme(scheme_id: str, reason: str = ""):
+    """Reject a scheme from pending_approval."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    success = workflow.reject_pending_scheme(scheme_id, reason)
+    if success:
+        return {"status": "success", "message": "Scheme rejected"}
+    return {"status": "error", "message": "Failed to reject scheme"}
+
+@app.get("/admin/stats")
+async def get_approval_stats():
+    """Get approval workflow statistics."""
+    from agent.approval_workflow import ApprovalWorkflow
+    workflow = ApprovalWorkflow(os.getenv("MONGODB_URI"))
+    stats = workflow.get_approval_stats()
+    return stats
+
+# Conversation History Endpoints
+@app.get("/history/{session_id}")
+async def get_history(session_id: str):
+    """Get conversation history for a session."""
+    from agent.conversation_history import get_conversation_history
+    history = get_conversation_history(session_id)
+    if history:
+        history['_id'] = str(history['_id'])
+        history['created_at'] = history['created_at'].isoformat()
+        history['updated_at'] = history['updated_at'].isoformat()
+    return {"history": history}
+
+@app.get("/history")
+async def get_all_history(limit: int = 50):
+    """Get all conversation histories."""
+    from agent.conversation_history import get_all_conversations
+    histories = get_all_conversations(limit)
+    for h in histories:
+        h['_id'] = str(h['_id'])
+        h['created_at'] = h['created_at'].isoformat()
+        h['updated_at'] = h['updated_at'].isoformat()
+    return {"histories": histories}
+
+@app.get("/history/search")
+async def search_history(query: str, limit: int = 20):
+    """Search conversation histories."""
+    from agent.conversation_history import search_conversations
+    histories = search_conversations(query, limit)
+    for h in histories:
+        h['_id'] = str(h['_id'])
+        h['created_at'] = h['created_at'].isoformat()
+        h['updated_at'] = h['updated_at'].isoformat()
+    return {"histories": histories}
+
+@app.delete("/history/{session_id}")
+async def delete_history(session_id: str):
+    """Delete a conversation history."""
+    from agent.conversation_history import delete_conversation
+    success = delete_conversation(session_id)
+    return {"status": "success" if success else "error"}
+
+@app.get("/history/stats")
+async def get_history_stats():
+    """Get conversation history statistics."""
+    from agent.conversation_history import get_conversation_stats
+    stats = get_conversation_stats()
+    return stats
+
+# Email Reminder Endpoints
+@app.post("/email/test")
+async def send_test_email(request: dict):
+    """Send a test email to verify email configuration."""
+    from agent.email_scheduler import send_test_email
+    to_email = request.get("email")
+    if not to_email:
+        raise HTTPException(status_code=400, detail="Email address required")
+    success = send_test_email(to_email)
+    return {"status": "success" if success else "error"}
+
+@app.post("/email/subscribe")
+async def subscribe_email_reminders(request: dict):
+    """Subscribe user to email reminders."""
+    session_id = request.get("session_id")
+    email = request.get("email")
+    subscribe = request.get("subscribe", True)
+    
+    if not session_id or not email:
+        raise HTTPException(status_code=400, detail="session_id and email required")
+    
+    result = sync_users_collection.update_one(
+        {"session_id": session_id},
+        {"$set": {"email": email, "email_reminders": subscribe}}
+    )
+    
+    return {"status": "success", "modified": result.modified_count > 0}
+
+@app.get("/email/schedule")
+async def schedule_email_reminders():
+    """Manually trigger scheduling of email reminders."""
+    from agent.email_scheduler import schedule_deadline_reminders
+    schedule_deadline_reminders()
+    return {"status": "success", "message": "Email reminders scheduled"}
 
 
 # RAG endpoint – simple semantic search over stored schemes
