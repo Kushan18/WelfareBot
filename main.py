@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 logging.getLogger("pymongo").setLevel(logging.WARNING)
 
 # Ensure module path works when running via uvicorn
@@ -397,32 +399,41 @@ async def get_schemes():
 
 
 # Serve React frontend (SPA)
-# Mount static files
-try:
-    app.mount("/static", StaticFiles(directory="frontend/build/static"), name="static")
-    app.mount("/favicon.ico", StaticFiles(directory="frontend/build"), name="favicon")
-except Exception as e:
-    logger.warning(f"Could not mount static files (frontend may not be built yet): {e}")
+# Mount static files - only if build exists
+import os.path
+frontend_build_exists = os.path.exists("frontend/build")
+if frontend_build_exists:
+    try:
+        app.mount("/static", StaticFiles(directory="frontend/build/static"), name="static")
+        if os.path.exists("frontend/build/favicon.ico"):
+            app.mount("/favicon.ico", StaticFiles(directory="frontend/build"), name="favicon")
+        logger.info("Frontend static files mounted successfully")
+    except Exception as e:
+        logger.warning(f"Could not mount static files: {e}")
+else:
+    logger.warning("Frontend build directory not found - serving API only")
 
 @app.get("/")
 async def serve_react():
-    try:
-        return FileResponse("frontend/build/index.html")
-    except Exception as e:
-        logger.warning(f"Could not serve index.html (frontend may not be built yet): {e}")
-        return {"status": "backend_running", "message": "Frontend not built yet"}
+    if frontend_build_exists:
+        try:
+            return FileResponse("frontend/build/index.html")
+        except Exception as e:
+            logger.warning(f"Could not serve index.html: {e}")
+    return {"status": "backend_running", "message": "API endpoints available"}
 
 @app.get("/{full_path:path}")
 async def catch_all(full_path: str):
     """Catch all routes for React SPA routing"""
     # Don't catch API routes
-    if full_path.startswith("api") or full_path.startswith("admin") or full_path.startswith("health"):
+    if full_path.startswith("chat") or full_path.startswith("voice") or full_path.startswith("send-reminder") or full_path.startswith("schedule-reminder") or full_path.startswith("reminders") or full_path.startswith("admin") or full_path.startswith("health") or full_path.startswith("schemes") or full_path.startswith("session"):
         raise HTTPException(status_code=404, detail="Not found")
-    try:
-        return FileResponse("frontend/build/index.html")
-    except Exception as e:
-        logger.warning(f"Could not serve index.html (frontend may not be built yet): {e}")
-        raise HTTPException(status_code=404, detail="Frontend not built yet")
+    if frontend_build_exists:
+        try:
+            return FileResponse("frontend/build/index.html")
+        except Exception as e:
+            logger.warning(f"Could not serve index.html: {e}")
+    raise HTTPException(status_code=404, detail="Frontend not built yet")
 
 
 @app.get("/session")
