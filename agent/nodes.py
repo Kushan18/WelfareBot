@@ -51,6 +51,7 @@ REQUIRED_FIELDS = [
     "gender",
     "age",
     "income_bracket",
+    "land_size",
     "email",
 ]
 
@@ -234,6 +235,7 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
         "gender",
         "age",
         "income_bracket",
+        "land_size",
         "email",
     ]
     questions = {
@@ -243,6 +245,7 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
         "gender": "Gender? (Male/Female/Other)",
         "age": "How old are you?",
         "income_bracket": "Annual family income in rupees?",
+        "land_size": "How much land do you own (in acres)? (Optional - enter 0 if none)",
         "email": "What is your email address? (Optional - for sending reminders about scheme deadlines)",
     }
     # Handle form/chat choice
@@ -290,8 +293,9 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
                 f"Gender: {user_doc.get('gender')}\n"
                 f"Age: {user_doc.get('age')}\n"
                 f"Income: {user_doc.get('income_bracket')}\n"
+                f"Land Size: {user_doc.get('land_size', 'Not provided')} acres\n"
                 f"Email: {user_doc.get('email', 'Not provided')}\n\n"
-                f"Is this correct?"
+                f"Is this correct? (Yes/No)"
             )
             state["reply"] = summary
             state["onboarding_step"] = "confirmation"
@@ -306,12 +310,14 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
     # Handle confirmation step
     if current_step == "confirmation":
         if state.get("confirmation_step") == "awaiting_confirmation":
-            if message.strip().lower() in ["yes", "y", "yeah", "correct", "right"]:
+            user_response = message.strip().lower()
+            # More flexible yes/no detection
+            if user_response in ["yes", "y", "yeah", "correct", "right", "yes continue", "continue"]:
                 # User confirmed – directly call handle_scheme_query
                 update_profile({"confirmation_step": None})
                 return handle_scheme_query(state)
-            elif message.strip().lower() in ["no", "n", "edit", "change"]:
-                state["reply"] = "Which field would you like to edit? (name, state, occupation, category, gender, age, income)"
+            elif user_response in ["no", "n", "edit", "change", "edit details"]:
+                state["reply"] = "Which field would you like to edit? (name, state, occupation, category, gender, age, income, land_size, email)"
                 state["confirmation_step"] = "selecting_field"
                 state["editing_field"] = None
                 return state
@@ -327,11 +333,13 @@ def handle_onboarding(state: Dict[str, Any]) -> Dict[str, Any]:
                 "category": "caste_category",
                 "gender": "gender",
                 "age": "age",
-                "income": "income_bracket"
+                "income": "income_bracket",
+                "land_size": "land_size",
+                "email": "email"
             }
             field_to_edit = field_map.get(message.lower().strip())
             if not field_to_edit:
-                state["reply"] = "Please choose: name, state, occupation, category, gender, age, or income"
+                state["reply"] = "Please choose: name, state, occupation, category, gender, age, income, land_size, or email"
                 return state
             state["editing_field"] = field_to_edit
             state["reply"] = f"What is your new {field_to_edit}?"
@@ -411,18 +419,20 @@ def handle_scheme_query(state: Dict[str, Any]) -> Dict[str, Any]:
         schemes = match_schemes(user_doc, sync_schemes_collection)
         logger.info(f"DEBUG handle_scheme_query: Found {len(schemes)} schemes")
         if schemes:
-            scheme_text = "\n".join(
-                [f"• **{s['name']}**: {s['description']}\n  Apply: {s['apply_link']}" for s in schemes[:5]]
-            )
-            state["reply"] = f"Here are the schemes that match your profile:\n{scheme_text}"
+            # Generate chips for scheme selection
+            scheme_chips = [s['name'] for s in schemes[:10]]
+            state["chips"] = scheme_chips
             state["schemes"] = schemes
+            state["reply"] = f"I found {len(schemes)} schemes that match your profile! Select a scheme to learn more:"
         else:
             state["reply"] = "No exact matches found right now. Check back later for new schemes!"
             state["schemes"] = []
+            state["chips"] = []
     except Exception as e:
         logger.error(f"Scheme query error: {e}")
         state["reply"] = "I'm having trouble fetching schemes right now. Please try again later."
         state["schemes"] = []
+        state["chips"] = []
     
     # Mark onboarding as complete after scheme query
     update_profile({"onboarding_step": "complete"})

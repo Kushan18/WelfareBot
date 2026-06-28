@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import axios from 'axios';
 import './ProfileModal.css';
 
-const API = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const API = process.env.REACT_APP_API_URL || '';
 const STATES = ['Andhra Pradesh','Arunachal Pradesh','Assam','Bihar','Chhattisgarh','Goa','Gujarat','Haryana','Himachal Pradesh','Jharkhand','Karnataka','Kerala','Madhya Pradesh','Maharashtra','Manipur','Meghalaya','Mizoram','Nagaland','Odisha','Punjab','Rajasthan','Sikkim','Tamil Nadu','Telangana','Tripura','Uttar Pradesh','Uttarakhand','West Bengal','Delhi','Jammu & Kashmir','Ladakh'];
 const OCCUPATIONS = ['Student','Farmer','Daily Wage Worker','Self Employed','Government Employee','Private Employee','Unemployed','Homemaker','Retired','Other'];
 const INCOMES = ['Below Rs.1 Lakh','Rs.1-2.5 Lakh','Rs.2.5-5 Lakh','Rs.5-10 Lakh','Above Rs.10 Lakh'];
@@ -10,7 +10,7 @@ const LANGS = ['English','Hindi','Telugu','Tamil','Kannada'];
 const CASTES = ['General','OBC','SC','ST','EWS'];
 
 export default function ProfileModal({ sessionId, prefillName, onClose }) {
-  const [form, setForm] = useState({ name: prefillName||'', language_preference:'English', state:'', occupation:'', caste_category:'', gender:'', age:'', income_bracket:'', aadhaar:'' });
+  const [form, setForm] = useState({ name: '', language_preference:'English', state:'', occupation:'', caste_category:'', gender:'', age:'', income_bracket:'', land_size:'', email:'' });
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
@@ -73,7 +73,8 @@ export default function ProfileModal({ sessionId, prefillName, onClose }) {
             <div className='form-field full'><label className='field-label'>Gender *</label><div className='chip-select'>{['Male','Female','Other'].map(g => <Chip key={g} field='gender' val={g} />)}</div></div>
             <div className='form-field'><label className='field-label'>Age *</label><input type='number' value={form.age} onChange={e => set('age', e.target.value)} placeholder='e.g. 28' min='1' max='120' /></div>
             <div className='form-field'><label className='field-label'>Annual Income *</label><select value={form.income_bracket} onChange={e => set('income_bracket', e.target.value)}><option value=''>Select range</option>{INCOMES.map(i => <option key={i} value={i}>{i}</option>)}</select></div>
-            <div className='form-field'><label className='field-label'>Aadhaar last 4 (optional)</label><input type='text' value={form.aadhaar} onChange={e => set('aadhaar', e.target.value)} placeholder='XXXX' maxLength={4} /></div>
+            <div className='form-field'><label className='field-label'>Land Size (acres)</label><input type='number' value={form.land_size} onChange={e => set('land_size', e.target.value)} placeholder='e.g. 5' min='0' /></div>
+            <div className='form-field'><label className='field-label'>Email (optional)</label><input type='email' value={form.email} onChange={e => set('email', e.target.value)} placeholder='e.g. kushan@example.com' /></div>
           </div>
           {error && <div className='form-error'>{error}</div>}
           <div className='form-footer'>
