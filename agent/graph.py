@@ -1,3 +1,4 @@
+import logging
 from langgraph.graph import StateGraph, END
 from agent.state import ConversationState
 from agent.nodes import (
@@ -6,6 +7,8 @@ from agent.nodes import (
     handle_faq,
     handle_scheme_query,
 )
+
+logger = logging.getLogger(__name__)
 
 def build_graph(groq_client, users_collection, schemes_collection):
     """Create a LangGraph workflow for WelfareBot.
