@@ -12,5 +12,5 @@ chromadb
 sentence-transformers
 langgraph
 langchain
-playwright
 groq
+motor
